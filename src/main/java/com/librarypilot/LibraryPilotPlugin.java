@@ -74,6 +74,11 @@ public class LibraryPilotPlugin extends Plugin
 	private static final int REGRAB_DETOUR_MULTIPLIER = 3;
 	private static final String BOOKSHELF = "Bookshelf";
 	private static final int INVENTORY_SIZE = 28;
+	/**
+	 * Efficient mode only takes a spare book when at least this many inventory slots are free.
+	 * This leaves one slot available for the actual requested book.
+	 */
+	private static final int MIN_FREE_SLOTS_FOR_SPARE = 2;
 
 	enum Task
 	{
@@ -155,6 +160,12 @@ public class LibraryPilotPlugin extends Plugin
 	 */
 	@Getter(AccessLevel.PACKAGE)
 	private volatile boolean claimXp;
+
+	/**
+	 * Number of currently free inventory slots. Used by efficient mode so spare books cannot
+	 * consume the final slot needed for the requested book.
+	 */
+	private volatile int inventoryFreeSlots = INVENTORY_SIZE;
 
 	/**
 	 * The bookshelf the path leads to, when it is loaded.
@@ -358,12 +369,16 @@ public class LibraryPilotPlugin extends Plugin
 			log.debug("Found {} library transports", transports.size());
 		}
 
-		updatePath(location);
 		if (claimXp)
 		{
-			// A full inventory can't take any more books, so reading the reward books comes first
-			task = Task.CLAIM_XP;
+			// A full inventory can't take any more books. Do this before calculating a route so an
+			// old/main bookshelf path cannot remain visible while the player is supposed to make space.
+			clearPath();
+			setTask(Task.CLAIM_XP, null, null);
+			return;
 		}
+
+		updatePath(location);
 	}
 
 	private void updatePath(WorldPoint location)
@@ -375,6 +390,12 @@ public class LibraryPilotPlugin extends Plugin
 		List<WorldPoint> shelves = null;
 
 		Book wanted = library.getCustomerBook();
+		log.debug(
+			"[PATH] wanted={} haveWanted={} regrab={} detourBook={}",
+			wanted,
+			wanted != null && playerBooks.contains(wanted),
+			regrabBook,
+			detourBook);
 		if (wanted != null && playerBooks.contains(wanted))
 		{
 			// Holding the requested book, take it to whoever asked for it
@@ -422,7 +443,10 @@ public class LibraryPilotPlugin extends Plugin
 		}
 
 		int mainDist = search.distance(mainTargets);
-		if (config.efficientMode() && mainDist != PathFinder.UNREACHABLE && detourForSpareBook(search, mainTargets, mainDist, wanted))
+		if (config.efficientMode()
+			&& inventoryFreeSlots >= MIN_FREE_SLOTS_FOR_SPARE
+			&& mainDist != PathFinder.UNREACHABLE
+			&& detourForSpareBook(search, mainTargets, mainDist, wanted))
 		{
 			return;
 		}
@@ -502,6 +526,17 @@ public class LibraryPilotPlugin extends Plugin
 			return false;
 		}
 		detourBook = knownBook(best);
+
+		log.debug(
+			"[EFFICIENT] Choosing detour book={} shelf={} detour={} allowedNormal={} regrab={} wanted={} inventory={}",
+			detourBook,
+			best.getLocation(),
+			bestDetour,
+			maxDetour,
+			regrabBook,
+			wanted,
+			playerBooks);
+
 		publish(search.pathTo(standTiles(best.getLocation())), best.getLocation(), null);
 		return true;
 	}
@@ -710,6 +745,10 @@ public class LibraryPilotPlugin extends Plugin
 				lastBookcaseAnimatedOn = null;
 				if (book == regrabBook)
 				{
+					log.debug(
+						"[EFFICIENT] Regrab book {} found. Clearing regrab state.",
+						regrabBook);
+
 					regrabBook = null;
 				}
 			}
@@ -748,6 +787,10 @@ public class LibraryPilotPlugin extends Plugin
 			{
 				lastServedCustomer = npcHead.getModelId();
 				regrabBook = library.getCustomerBook();
+
+				log.debug(
+					"[EFFICIENT] Customer completed. Setting regrabBook={}",
+					regrabBook);
 			}
 			library.setCustomer(-1, null);
 		}
@@ -777,7 +820,24 @@ public class LibraryPilotPlugin extends Plugin
 			}
 		}
 		playerBooks = books;
-		claimXp = used >= INVENTORY_SIZE && hasXpBook;
+		inventoryFreeSlots = Math.max(0, INVENTORY_SIZE - used);
+		claimXp = inventoryFreeSlots == 0 && hasXpBook;
+
+		log.debug(
+			"[INVENTORY] used={}/{} books={} hasXpBook={} claimXp={} regrab={}",
+			used,
+			INVENTORY_SIZE,
+			playerBooks,
+			hasXpBook,
+			claimXp,
+			regrabBook);
+
+		// Inventory state is more reliable than the bookshelf popup for confirming a successful
+		// re-grab. If the book is now present, stop giving it the enlarged detour allowance.
+		if (regrabBook != null && books.contains(regrabBook))
+		{
+			regrabBook = null;
+		}
 	}
 
 	/**
